@@ -74,7 +74,7 @@ export class HardwareWebSocket {
 
       // Generate UUID if not provided
       if (!request.uuid) {
-        request.uuid = Math.random().toString(36).substr(2, 5)
+        request.uuid = generateUUID()
       }
 
       // Set up response handler
@@ -101,5 +101,5 @@ export class HardwareWebSocket {
 
 // Utility function to generate UUID
 export function generateUUID(): string {
-  return Math.random().toString(36).substr(2, 5)
+  return Math.floor(10000 + Math.random() * 90000).toString()
 }

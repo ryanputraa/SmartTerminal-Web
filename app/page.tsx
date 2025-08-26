@@ -1,7 +1,7 @@
 import Link from "next/link"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
-import { Camera, CreditCard, FileText, Fingerprint, PenTool, Zap } from "lucide-react"
+import { Camera, CreditCard, FileText, Fingerprint, Zap } from "lucide-react"
 
 const hardwareDevices = [
   {
@@ -43,14 +43,6 @@ const hardwareDevices = [
     icon: Fingerprint,
     href: "/fingerprint",
     color: "bg-red-500",
-  },
-  {
-    id: "signature",
-    title: "Signature Pen",
-    description: "Test digital signature capture and preview functionality",
-    icon: PenTool,
-    href: "/signature",
-    color: "bg-indigo-500",
   },
 ]
 
