@@ -18,6 +18,7 @@ function downloadDataUrl(dataUrl: string, filename: string) {
 
 async function processDocumentCrop(dataUrl: string): Promise<string | null> {
   try {
+    // --- Load image ---
     const img = await new Promise<HTMLImageElement>((resolve, reject) => {
       const i = new Image()
       i.crossOrigin = "anonymous"
@@ -26,129 +27,139 @@ async function processDocumentCrop(dataUrl: string): Promise<string | null> {
       i.src = dataUrl
     })
 
-    const w = img.naturalWidth
-    const h = img.naturalHeight
-    if (!w || !h) return null
+    // --- Rotate left (90° counterclockwise) ---
+    const rotatedCanvas = document.createElement("canvas")
+    rotatedCanvas.width = img.naturalHeight
+    rotatedCanvas.height = img.naturalWidth
+    const rctx = rotatedCanvas.getContext("2d")!
+    // move origin to bottom-left, rotate CCW
+    rctx.translate(0, rotatedCanvas.height)
+    rctx.rotate(-Math.PI / 2)
+    rctx.drawImage(img, 0, 0)
 
-    // Draw to canvas
-    const srcCanvas = document.createElement("canvas")
-    srcCanvas.width = w
-    srcCanvas.height = h
-    const ctx = srcCanvas.getContext("2d", { willReadFrequently: true })
-    if (!ctx) return null
-    ctx.drawImage(img, 0, 0, w, h)
-    const src = ctx.getImageData(0, 0, w, h)
-    const d = src.data
+    // from here on, treat the rotated image as the base
+    const w = rotatedCanvas.width
+    const h = rotatedCanvas.height
 
-    // --- Step 1: adaptive mask for bright area (paper) ---
-    const mask = new Uint8Array(w * h)
-    const luminance = (r: number, g: number, b: number) => 0.2126 * r + 0.7152 * g + 0.0722 * b
+    // --- Downscale for document boundary detection ---
+    const scale = Math.max(w, h) > 2000 ? 0.25 : 1
+    const smallW = Math.floor(w * scale)
+    const smallH = Math.floor(h * scale)
+    const sCanvas = document.createElement("canvas")
+    sCanvas.width = smallW
+    sCanvas.height = smallH
+    const sctx = sCanvas.getContext("2d", { willReadFrequently: true })!
+    sctx.drawImage(rotatedCanvas, 0, 0, smallW, smallH)
+    const { data } = sctx.getImageData(0, 0, smallW, smallH)
 
-    // Compute global mean luminance
-    let sumL = 0
-    for (let i = 0; i < d.length; i += 4) sumL += luminance(d[i], d[i + 1], d[i + 2])
-    const avgL = sumL / (w * h)
-
-    const WHITE_LUMA = Math.max(140, avgL * 1.1) // adapt to lighting
-    const CHROMA_T = 40 // allow small color tint (warmer paper, etc.)
-
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const idx = (y * w + x) * 4
-        const r = d[idx],
-          g = d[idx + 1],
-          b = d[idx + 2]
-        const lum = luminance(r, g, b)
-        const chroma = Math.max(r, g, b) - Math.min(r, g, b)
-        mask[y * w + x] = lum >= WHITE_LUMA && chroma <= CHROMA_T ? 1 : 0
-      }
-    }
-
-    // --- Step 2: simple blur/close to merge noisy regions ---
-    const smooth = new Uint8Array(w * h)
-    for (let y = 1; y < h - 1; y++) {
-      for (let x = 1; x < w - 1; x++) {
-        let sum = 0
-        for (let dy = -1; dy <= 1; dy++)
-          for (let dx = -1; dx <= 1; dx++) sum += mask[(y + dy) * w + (x + dx)]
-        smooth[y * w + x] = sum >= 4 ? 1 : 0 // majority filter
-      }
-    }
-
-    // --- Step 3: find largest connected white region ---
-    const visited = new Uint8Array(w * h)
-    let bestBox = null
-    let bestCount = 0
-
-    function floodFill(sx: number, sy: number) {
-      const stack = [[sx, sy]]
-      let minX = sx,
-        maxX = sx,
-        minY = sy,
-        maxY = sy
-      let count = 0
-      visited[sy * w + sx] = 1
-
-      while (stack.length) {
-        const [x, y] = stack.pop()!
-        count++
-        if (x < minX) minX = x
-        if (x > maxX) maxX = x
-        if (y < minY) minY = y
-        if (y > maxY) maxY = y
-
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const nx = x + dx,
-              ny = y + dy
-            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue
-            const idx = ny * w + nx
-            if (!visited[idx] && smooth[idx]) {
-              visited[idx] = 1
-              stack.push([nx, ny])
-            }
-          }
-        }
-      }
-
-      return { minX, minY, maxX, maxY, count }
-    }
-
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const idx = y * w + x
-        if (!smooth[idx] || visited[idx]) continue
-        const box = floodFill(x, y)
-        if (box.count > bestCount) {
-          bestCount = box.count
-          bestBox = box
+    // --- Find bounds of non-black area ---
+    const blackThreshold = 25
+    let minX = smallW, minY = smallH, maxX = 0, maxY = 0
+    for (let y = 0; y < smallH; y++) {
+      const row = y * smallW * 4
+      for (let x = 0; x < smallW; x++) {
+        const i = row + x * 4
+        const brightness = (data[i] + data[i + 1] + data[i + 2]) / 3
+        if (brightness > blackThreshold) {
+          if (x < minX) minX = x
+          if (x > maxX) maxX = x
+          if (y < minY) minY = y
+          if (y > maxY) maxY = y
         }
       }
     }
 
-    if (!bestBox || bestCount < w * h * 0.02) {
-      console.warn("No significant paper region found; returning original.")
-      return dataUrl
+    if (maxX <= minX || maxY <= minY) return rotatedCanvas.toDataURL("image/jpeg", 0.95)
+
+    // --- Map bounds to full res ---
+    const invScale = 1 / scale
+    const margin = Math.floor(Math.min(w, h) * 0.02)
+    const fx1 = Math.max(0, Math.floor(minX * invScale) - margin)
+    const fy1 = Math.max(0, Math.floor(minY * invScale) - margin)
+    const fx2 = Math.min(w - 1, Math.ceil(maxX * invScale) + margin)
+    const fy2 = Math.min(h - 1, Math.ceil(maxY * invScale) + margin)
+    const cropW = fx2 - fx1
+    const cropH = fy2 - fy1
+
+    // --- Crop ---
+    const cCanvas = document.createElement("canvas")
+    cCanvas.width = cropW
+    cCanvas.height = cropH
+    const cctx = cCanvas.getContext("2d", { willReadFrequently: true })!
+    cctx.drawImage(rotatedCanvas, fx1, fy1, cropW, cropH, 0, 0, cropW, cropH)
+
+    // --- Get pixels ---
+    const imgData = cctx.getImageData(0, 0, cropW, cropH)
+    const pixels = imgData.data
+
+    // --- Step 1: Shadow compensation (left/right) ---
+    const mid = Math.floor(cropW / 2)
+    let leftSum = 0, rightSum = 0, leftCount = 0, rightCount = 0
+
+    for (let y = 0; y < cropH; y++) {
+      for (let x = 0; x < cropW; x++) {
+        const i = (y * cropW + x) * 4
+        const lum = 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2]
+        if (x < mid) {
+          leftSum += lum
+          leftCount++
+        } else {
+          rightSum += lum
+          rightCount++
+        }
+      }
     }
 
-    const { minX, minY, maxX, maxY } = bestBox
-    const cw = maxX - minX + 1
-    const ch = maxY - minY + 1
+    const leftAvg = leftSum / leftCount
+    const rightAvg = rightSum / rightCount
+    const targetAvg = (leftAvg + rightAvg) / 2
 
-    // --- Step 4: crop output canvas ---
-    const outCanvas = document.createElement("canvas")
-    outCanvas.width = cw
-    outCanvas.height = ch
-    const octx = outCanvas.getContext("2d")
-    if (!octx) return null
+    const leftGain = leftAvg < rightAvg ? targetAvg / leftAvg : 1
+    const rightGain = rightAvg < leftAvg ? targetAvg / rightAvg : 1
 
-    octx.drawImage(img, minX, minY, cw, ch, 0, 0, cw, ch)
-    return outCanvas.toDataURL("image/jpeg", 0.95)
-  } catch (e) {
-    console.error("[v1] Scanner crop failed:", e)
+    for (let y = 0; y < cropH; y++) {
+      for (let x = 0; x < cropW; x++) {
+        const i = (y * cropW + x) * 4
+        const gain = x < mid ? leftGain : rightGain
+        pixels[i]     = Math.min(255, pixels[i] * gain)
+        pixels[i + 1] = Math.min(255, pixels[i + 1] * gain)
+        pixels[i + 2] = Math.min(255, pixels[i + 2] * gain)
+      }
+    }
+
+    // --- Step 2: Additive enhancement ---
+    const threshold_high = 20
+    const threshold_low = 10
+    const boost = 80
+    const cap = 220
+    const darkenFactor = 0.5
+
+    for (let i = 0; i < pixels.length; i += 4) {
+      const lum = 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2]
+
+      if (lum > threshold_high) {
+        const strength = (lum - threshold_high) / (255 - threshold_high)
+        const add = boost * strength
+        pixels[i]     = Math.min(cap, pixels[i] + add)
+        pixels[i + 1] = Math.min(cap, pixels[i + 1] + add)
+        pixels[i + 2] = Math.min(cap, pixels[i + 2] + add)
+      } else if (lum < threshold_low) {
+        pixels[i]     = pixels[i] * darkenFactor
+        pixels[i + 1] = pixels[i + 1] * darkenFactor
+        pixels[i + 2] = pixels[i + 2] * darkenFactor
+      }
+    }
+
+    // --- Output ---
+    cctx.putImageData(imgData, 0, 0)
+    return cCanvas.toDataURL("image/jpeg", 0.95)
+  } catch (err) {
+    console.error("Document crop/enhance failed:", err)
     return null
   }
 }
+
+
 
 
 
