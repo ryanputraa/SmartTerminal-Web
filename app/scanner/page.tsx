@@ -124,42 +124,16 @@ async function processDocumentCrop(dataUrl: string): Promise<string | null> {
     const cw = maxX - minX + 1
     const ch = maxY - minY + 1
 
-    // Compose output: white background; copy only white-paper pixels
     const outCanvas = document.createElement("canvas")
     outCanvas.width = cw
     outCanvas.height = ch
     const octx = outCanvas.getContext("2d")
     if (!octx) return null
 
-    // White background (no black borders)
-    octx.fillStyle = "#ffffff"
-    octx.fillRect(0, 0, cw, ch)
+    // Draw only the cropped region of the source image; nothing else is painted
+    octx.drawImage(img, minX, minY, cw, ch, 0, 0, cw, ch)
 
-    const out = octx.createImageData(cw, ch)
-    const od = out.data
-    for (let y = 0; y < ch; y++) {
-      for (let x = 0; x < cw; x++) {
-        const sx = minX + x
-        const sy = minY + y
-        const sIdx = (sy * w + sx) * 4
-        const oIdx = (y * cw + x) * 4
-        if (closed[sy * w + sx]) {
-          od[oIdx] = d[sIdx]
-          od[oIdx + 1] = d[sIdx + 1]
-          od[oIdx + 2] = d[sIdx + 2]
-          od[oIdx + 3] = 255
-        } else {
-          // paint white where not paper (ensures no background bleed)
-          od[oIdx] = 255
-          od[oIdx + 1] = 255
-          od[oIdx + 2] = 255
-          od[oIdx + 3] = 255
-        }
-      }
-    }
-    octx.putImageData(out, 0, 0)
-
-    // Export high-quality JPEG; this "stretches" (scales) to the tight crop size automatically
+    // Export high-quality JPEG of the tight crop
     return outCanvas.toDataURL("image/jpeg", 0.95)
   } catch (e) {
     console.error("[v0] Scanner crop failed:", e)
@@ -250,6 +224,7 @@ export default function ScannerPage() {
                       processedImg ||
                       state.photoImg ||
                       "/placeholder.svg?height=200&width=200&query=last-captured-photo" ||
+                      "/placeholder.svg" ||
                       "/placeholder.svg"
                     }
                     alt="Last captured cropped document"
