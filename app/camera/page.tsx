@@ -5,6 +5,7 @@ import { Header } from "@/components/aires/header"
 import { useHardwareWS } from "@/hooks/use-hardware-ws"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { useEffect } from "react"
 
 // Utility to download the current preview as a photo
 function downloadDataUrl(dataUrl: string, filename: string) {
@@ -18,6 +19,15 @@ function downloadDataUrl(dataUrl: string, filename: string) {
 
 export default function CameraPage() {
   const { connected, statusText, state, sendCmd } = useHardwareWS()
+
+  useEffect(() => {
+    if (connected) {
+      sendCmd("camera", "open")
+    }
+    return () => {
+      sendCmd("camera", "close")
+    }
+  }, [connected, sendCmd])
 
   return (
     <main className="min-h-dvh">
