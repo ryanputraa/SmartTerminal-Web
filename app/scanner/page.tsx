@@ -7,6 +7,8 @@ import { useHardwareWS } from "@/hooks/use-hardware-ws"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 
+
+
 function downloadDataUrl(dataUrl: string, filename: string) {
   const a = document.createElement("a")
   a.href = dataUrl
@@ -16,157 +18,255 @@ function downloadDataUrl(dataUrl: string, filename: string) {
   a.remove()
 }
 
-async function processDocumentCrop(dataUrl: string): Promise<string | null> {
-  try {
-    // --- Load image ---
-    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const i = new Image()
-      i.crossOrigin = "anonymous"
-      i.onload = () => resolve(i)
-      i.onerror = reject
-      i.src = dataUrl
-    })
+function useOpenCV() {
+  const [ready, setReady] = useState(false)
 
-    // --- Rotate left (90° counterclockwise) ---
-    const rotatedCanvas = document.createElement("canvas")
-    rotatedCanvas.width = img.naturalHeight
-    rotatedCanvas.height = img.naturalWidth
-    const rctx = rotatedCanvas.getContext("2d")!
-    // move origin to bottom-left, rotate CCW
-    rctx.translate(0, rotatedCanvas.height)
-    rctx.rotate(-Math.PI / 2)
-    rctx.drawImage(img, 0, 0)
-
-    // from here on, treat the rotated image as the base
-    const w = rotatedCanvas.width
-    const h = rotatedCanvas.height
-
-    // --- Downscale for document boundary detection ---
-    const scale = Math.max(w, h) > 2000 ? 0.25 : 1
-    const smallW = Math.floor(w * scale)
-    const smallH = Math.floor(h * scale)
-    const sCanvas = document.createElement("canvas")
-    sCanvas.width = smallW
-    sCanvas.height = smallH
-    const sctx = sCanvas.getContext("2d", { willReadFrequently: true })!
-    sctx.drawImage(rotatedCanvas, 0, 0, smallW, smallH)
-    const { data } = sctx.getImageData(0, 0, smallW, smallH)
-
-    // --- Find bounds of non-black area ---
-    const blackThreshold = 25
-    let minX = smallW, minY = smallH, maxX = 0, maxY = 0
-    for (let y = 0; y < smallH; y++) {
-      const row = y * smallW * 4
-      for (let x = 0; x < smallW; x++) {
-        const i = row + x * 4
-        const brightness = (data[i] + data[i + 1] + data[i + 2]) / 3
-        if (brightness > blackThreshold) {
-          if (x < minX) minX = x
-          if (x > maxX) maxX = x
-          if (y < minY) minY = y
-          if (y > maxY) maxY = y
-        }
-      }
+  useEffect(() => {
+    // Skip if already loaded
+    if (typeof window !== "undefined" && (window as any).cv) {
+      setReady(true)
+      return
     }
 
-    if (maxX <= minX || maxY <= minY) return rotatedCanvas.toDataURL("image/jpeg", 0.95)
-
-    // --- Map bounds to full res ---
-    const invScale = 1 / scale
-    const margin = Math.floor(Math.min(w, h) * 0.02)
-    const fx1 = Math.max(0, Math.floor(minX * invScale) - margin)
-    const fy1 = Math.max(0, Math.floor(minY * invScale) - margin)
-    const fx2 = Math.min(w - 1, Math.ceil(maxX * invScale) + margin)
-    const fy2 = Math.min(h - 1, Math.ceil(maxY * invScale) + margin)
-    const cropW = fx2 - fx1
-    const cropH = fy2 - fy1
-
-    // --- Crop ---
-    const cCanvas = document.createElement("canvas")
-    cCanvas.width = cropW
-    cCanvas.height = cropH
-    const cctx = cCanvas.getContext("2d", { willReadFrequently: true })!
-    cctx.drawImage(rotatedCanvas, fx1, fy1, cropW, cropH, 0, 0, cropW, cropH)
-
-    // --- Get pixels ---
-    const imgData = cctx.getImageData(0, 0, cropW, cropH)
-    const pixels = imgData.data
-
-    // --- Step 1: Shadow compensation (left/right) ---
-    const mid = Math.floor(cropW / 2)
-    let leftSum = 0, rightSum = 0, leftCount = 0, rightCount = 0
-
-    for (let y = 0; y < cropH; y++) {
-      for (let x = 0; x < cropW; x++) {
-        const i = (y * cropW + x) * 4
-        const lum = 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2]
-        if (x < mid) {
-          leftSum += lum
-          leftCount++
+    const script = document.createElement("script")
+    script.src = "https://docs.opencv.org/4.x/opencv.js"
+    script.async = true
+    script.onload = () => {
+      const check = () => {
+        if ((window as any).cv && (window as any).cv.Mat) {
+          setReady(true)
         } else {
-          rightSum += lum
-          rightCount++
+          setTimeout(check, 100)
         }
       }
+      check()
     }
+    document.body.appendChild(script)
+  }, [])
 
-    const leftAvg = leftSum / leftCount
-    const rightAvg = rightSum / rightCount
-    const targetAvg = (leftAvg + rightAvg) / 2
+  return ready
+}
 
-    const leftGain = leftAvg < rightAvg ? targetAvg / leftAvg : 1
-    const rightGain = rightAvg < leftAvg ? targetAvg / rightAvg : 1
+async function processDocumentCrop(dataUrl: string): Promise<string | null> {
+  // Wait for OpenCV to be ready
+  if (typeof cv === "undefined") {
+    await new Promise((resolve) => {
+      const check = () => (typeof cv !== "undefined" ? resolve(true) : setTimeout(check, 50))
+      check()
+    })
+  }
 
-    for (let y = 0; y < cropH; y++) {
-      for (let x = 0; x < cropW; x++) {
-        const i = (y * cropW + x) * 4
-        const gain = x < mid ? leftGain : rightGain
-        pixels[i]     = Math.min(255, pixels[i] * gain)
-        pixels[i + 1] = Math.min(255, pixels[i + 1] * gain)
-        pixels[i + 2] = Math.min(255, pixels[i + 2] * gain)
+  // Utility: load image into HTMLImageElement
+  function loadImage(src: string): Promise<HTMLImageElement> {
+    return new Promise((resolve, reject) => {
+      const img = new Image()
+      img.crossOrigin = "anonymous"
+      img.onload = () => resolve(img)
+      img.onerror = reject
+      img.src = src
+    })
+  }
+
+  try {
+    const img = await loadImage(dataUrl)
+    const src = cv.imread(img)
+
+    // Resize if huge
+    const maxDim = 1600
+    const scale = Math.min(1, maxDim / Math.max(src.cols, src.rows))
+    const resized = new cv.Mat()
+    cv.resize(src, resized, new cv.Size(0, 0), scale, scale, cv.INTER_AREA)
+
+    // --- Edge detection ---
+    const gray = new cv.Mat()
+    cv.cvtColor(resized, gray, cv.COLOR_RGBA2GRAY)
+    cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0)
+    const edges = new cv.Mat()
+    cv.Canny(gray, edges, 50, 150)
+
+    // --- Find contours ---
+    const contours = new cv.MatVector()
+    const hierarchy = new cv.Mat()
+    cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+    // Pick the biggest 4-corner contour
+    let bestCnt = null
+    let bestArea = 0
+    for (let i = 0; i < contours.size(); i++) {
+      const cnt = contours.get(i)
+      const peri = cv.arcLength(cnt, true)
+      const approx = new cv.Mat()
+      cv.approxPolyDP(cnt, approx, 0.02 * peri, true)
+      if (approx.rows === 4) {
+        const area = cv.contourArea(approx)
+        if (area > bestArea) {
+          bestArea = area
+          bestCnt = approx
+        } else {
+          approx.delete()
+        }
+      } else {
+        approx.delete()
       }
     }
 
-    // --- Step 2: Additive enhancement ---
-    const threshold_high = 20
-    const threshold_low = 10
-    const boost = 80
-    const cap = 220
-    const darkenFactor = 0.5
-
-    for (let i = 0; i < pixels.length; i += 4) {
-      const lum = 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2]
-
-      if (lum > threshold_high) {
-        const strength = (lum - threshold_high) / (255 - threshold_high)
-        const add = boost * strength
-        pixels[i]     = Math.min(cap, pixels[i] + add)
-        pixels[i + 1] = Math.min(cap, pixels[i + 1] + add)
-        pixels[i + 2] = Math.min(cap, pixels[i + 2] + add)
-      } else if (lum < threshold_low) {
-        pixels[i]     = pixels[i] * darkenFactor
-        pixels[i + 1] = pixels[i + 1] * darkenFactor
-        pixels[i + 2] = pixels[i + 2] * darkenFactor
+    let warped = new cv.Mat()
+    if (bestCnt && bestArea > 10000) {
+      // --- Perspective warp ---
+      // Order points (top-left, top-right, bottom-right, bottom-left)
+      const pts = []
+      for (let i = 0; i < 4; i++) {
+        const p = bestCnt.intPtr(i, 0)
+        pts.push({ x: p[0], y: p[1] })
       }
+      // Sort roughly clockwise
+      pts.sort((a, b) => a.y - b.y)
+      const top = pts.slice(0, 2).sort((a, b) => a.x - b.x)
+      const bottom = pts.slice(2).sort((a, b) => a.x - b.x)
+      const ordered = [top[0], top[1], bottom[1], bottom[0]]
+
+      const w1 = Math.hypot(ordered[1].x - ordered[0].x, ordered[1].y - ordered[0].y)
+      const w2 = Math.hypot(ordered[2].x - ordered[3].x, ordered[2].y - ordered[3].y)
+      const h1 = Math.hypot(ordered[3].x - ordered[0].x, ordered[3].y - ordered[0].y)
+      const h2 = Math.hypot(ordered[2].x - ordered[1].x, ordered[2].y - ordered[1].y)
+      const W = Math.max(w1, w2)
+      const H = Math.max(h1, h2)
+
+      const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
+        ordered[0].x, ordered[0].y,
+        ordered[1].x, ordered[1].y,
+        ordered[2].x, ordered[2].y,
+        ordered[3].x, ordered[3].y,
+      ])
+      const dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, W, 0, W, H, 0, H])
+      const M = cv.getPerspectiveTransform(srcPts, dstPts)
+      cv.warpPerspective(resized, warped, M, new cv.Size(W, H))
+      srcPts.delete(); dstPts.delete(); M.delete()
+    } else {
+      warped = resized.clone() // fallback: no contour
     }
 
-    // --- Output ---
-    cctx.putImageData(imgData, 0, 0)
-    return cCanvas.toDataURL("image/jpeg", 0.95)
-  } catch (err) {
-    console.error("Document crop/enhance failed:", err)
+    // --- Color correction ---
+    // Convert to float for math
+    const floatImg = new cv.Mat()
+    warped.convertTo(floatImg, cv.CV_32F)
+    const mean = new cv.Mat()
+    const stddev = new cv.Mat()
+    cv.meanStdDev(floatImg, mean, stddev)
+    const meanVals = mean.data64F
+    const ref = (meanVals[0] + meanVals[1] + meanVals[2]) / 3
+    const scaleB = ref / meanVals[0]
+    const scaleG = ref / meanVals[1]
+    const scaleR = ref / meanVals[2]
+
+    const channels = new cv.MatVector()
+    cv.split(warped, channels)
+    channels.get(0).convertTo(channels.get(0), -1, scaleB, 0)
+    channels.get(1).convertTo(channels.get(1), -1, scaleG, 0)
+    channels.get(2).convertTo(channels.get(2), -1, scaleR, 0)
+    cv.merge(channels, warped)
+    channels.delete(); mean.delete(); stddev.delete()
+
+    // --- Mild contrast and sharpen ---
+    cv.convertScaleAbs(warped, warped, 1.1, -15)
+    const kernel = cv.matFromArray(3, 3, cv.CV_32F, [
+      0, -1, 0,
+      -1, 5, -1,
+      0, -1, 0,
+    ])
+    cv.filter2D(warped, warped, -1, kernel)
+    kernel.delete()
+    
+        // --- Auto-rotate upright ---
+    const rotations = [0, 90, 180, 270]
+    let bestScore = -Infinity
+    let bestRotated: any = null
+    let bestAngle = 0
+
+    for (const angle of rotations) {
+      const rotated = new cv.Mat()
+      if (angle === 90) cv.rotate(warped, rotated, cv.ROTATE_90_CLOCKWISE)
+      else if (angle === 180) cv.rotate(warped, rotated, cv.ROTATE_180)
+      else if (angle === 270) cv.rotate(warped, rotated, cv.ROTATE_90_COUNTERCLOCKWISE)
+      else warped.copyTo(rotated)
+
+      // compute score: horizontal edge energy minus vertical edge energy
+      const grayR = new cv.Mat()
+      cv.cvtColor(rotated, grayR, cv.COLOR_RGBA2GRAY)
+      cv.GaussianBlur(grayR, grayR, new cv.Size(3, 3), 0)
+
+      const sobelX = new cv.Mat()
+      const sobelY = new cv.Mat()
+      cv.Sobel(grayR, sobelX, cv.CV_32F, 1, 0, 3)
+      cv.Sobel(grayR, sobelY, cv.CV_32F, 0, 1, 3)
+
+      const absX = new cv.Mat()
+      const absY = new cv.Mat()
+      cv.convertScaleAbs(sobelX, absX)
+      cv.convertScaleAbs(sobelY, absY)
+      const meanX = cv.mean(absX)[0]
+      const meanY = cv.mean(absY)[0]
+
+      // score and portrait preference tie-break
+      const score = meanX - meanY
+      const isPortrait = rotated.rows >= rotated.cols
+
+      // choose if strictly better, or nearly equal but portrait preferred
+      const EPS = 2.0 // small tolerance; tuneable
+      if (score > bestScore + 1e-6 || (Math.abs(score - bestScore) <= EPS && isPortrait && bestRotated)) {
+        // free previous bestRotated
+        if (bestRotated) bestRotated.delete()
+        bestRotated = rotated.clone()
+        bestScore = score
+        bestAngle = angle
+      }
+
+      // cleanup mats created for this iteration (but keep `rotated` clone only if chosen)
+      rotated.delete()
+      grayR.delete()
+      sobelX.delete(); sobelY.delete()
+      absX.delete(); absY.delete()
+    }
+
+    // If nothing chosen (shouldn't happen), fallback to original warped
+    if (!bestRotated) {
+      bestRotated = warped.clone()
+    }
+
+    // replace warped with the chosen orientation
+    warped.delete()
+    warped = bestRotated
+
+    // --- Export ---
+    const canvas = document.createElement("canvas")
+    cv.imshow(canvas, warped)
+
+    // cleanup
+    src.delete(); resized.delete(); gray.delete(); edges.delete()
+    contours.delete(); hierarchy.delete()
+    if (bestCnt) bestCnt.delete()
+    warped.delete(); floatImg.delete()
+
+    return canvas.toDataURL("image/jpeg", 0.9)
+  } catch (e) {
+    console.error("processDocumentCrop error:", e)
     return null
   }
 }
 
 
 
-
-
 export default function ScannerPage() {
+  const cvReady = useOpenCV()
   const { connected, statusText, state, sendCmd } = useHardwareWS()
-  const lastDownloadedRef = useRef<string | null>(null)
   const [processedImg, setProcessedImg] = useState<string | null>(null)
+  const lastDownloadedRef = useRef<string | null>(null)
+
+  // Wait until OpenCV is ready before scanning
+  useEffect(() => {
+    if (!cvReady) return
+    console.log("✅ OpenCV.js loaded and ready!")
+  }, [cvReady])
 
   // Auto open scanner on mount (when connected) and close on unmount
   useEffect(() => {

@@ -1,5 +1,4 @@
 "use client"
-
 import Link from "next/link"
 import { Header } from "@/components/aires/header"
 import { useHardwareWS } from "@/hooks/use-hardware-ws"
