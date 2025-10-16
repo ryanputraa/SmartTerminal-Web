@@ -6,6 +6,7 @@ import { Header } from "@/components/aires/header"
 import { useHardwareWS } from "@/hooks/use-hardware-ws"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { waitForDebugger } from "inspector"
 
 
 
@@ -19,32 +20,56 @@ function downloadDataUrl(dataUrl: string, filename: string) {
 }
 
 function useOpenCV() {
-  const [ready, setReady] = useState(false)
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    // Skip if already loaded
-    if (typeof window !== "undefined" && (window as any).cv) {
-      setReady(true)
-      return
+    // already loaded case
+    if (typeof window !== "undefined" && (window as any).cv && (window as any).cv.Mat) {
+      setReady(true);
+      return;
     }
 
-    const script = document.createElement("script")
-    script.src = "https://docs.opencv.org/4.x/opencv.js"
-    script.async = true
-    script.onload = () => {
-      const check = () => {
-        if ((window as any).cv && (window as any).cv.Mat) {
-          setReady(true)
-        } else {
-          setTimeout(check, 100)
+    // Use a single global loader promise (to prevent double load in dev)
+    if (!(window as any).__opencvPromise) {
+      (window as any).__opencvPromise = new Promise<void>((resolve, reject) => {
+        const existing = document.querySelector('script[src*="opencv.js"]');
+        if (existing) {
+          // If script already added, just wait for cv to exist
+          const check = () => {
+            if ((window as any).cv && (window as any).cv.Mat) resolve();
+            else setTimeout(check, 50);
+          };
+          check();
+          return;
         }
-      }
-      check()
-    }
-    document.body.appendChild(script)
-  }, [])
 
-  return ready
+        const script = document.createElement("script");
+        script.src = "https://docs.opencv.org/4.x/opencv.js";
+        script.async = true;
+        script.onload = () => {
+          const check = () => {
+            if ((window as any).cv && (window as any).cv.Mat) resolve();
+            else setTimeout(check, 50);
+          };
+          check();
+        };
+        script.onerror = reject;
+        document.body.appendChild(script);
+      });
+    }
+
+    // Wait for OpenCV to be ready
+    (window as any).__opencvPromise
+      .then(() => {
+        console.log("✅ OpenCV.js loaded");
+        setReady(true);
+      })
+      .catch((err: any) => {
+        console.error("❌ Failed to load OpenCV.js", err);
+      });
+  }, []);
+
+  return ready;
 }
 
 async function processDocumentCrop(dataUrl: string): Promise<string | null> {
@@ -71,23 +96,36 @@ async function processDocumentCrop(dataUrl: string): Promise<string | null> {
     const img = await loadImage(dataUrl)
     const src = cv.imread(img)
 
-    // Resize if huge
+    // Prepare scaled-down copy for contour detection
     const maxDim = 1600
     const scale = Math.min(1, maxDim / Math.max(src.cols, src.rows))
     const resized = new cv.Mat()
-    cv.resize(src, resized, new cv.Size(0, 0), scale, scale, cv.INTER_AREA)
+    if (scale < 1) {
+      cv.resize(src, resized, new cv.Size(0, 0), scale, scale, cv.INTER_AREA)
+    } else {
+      src.copyTo(resized)
+    }
 
-    // --- Edge detection ---
+
+    // --- Non-black mask detection ---
     const gray = new cv.Mat()
     cv.cvtColor(resized, gray, cv.COLOR_RGBA2GRAY)
-    cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0)
-    const edges = new cv.Mat()
-    cv.Canny(gray, edges, 50, 150)
+
+    // Create a mask of pixels that are NOT black (0–5 range)
+    const mask = new cv.Mat()
+    cv.threshold(gray, mask, 5, 255, cv.THRESH_BINARY)
+
+    // Optional: smooth edges & fill small holes
+    const kernel_2 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5))
+    cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel_2)
+    cv.morphologyEx(mask, mask, cv.MORPH_OPEN, kernel_2)
 
     // --- Find contours ---
     const contours = new cv.MatVector()
     const hierarchy = new cv.Mat()
-    cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+    cv.medianBlur(mask, mask, 5)
 
     // Pick the biggest 4-corner contour
     let bestCnt = null
@@ -109,7 +147,7 @@ async function processDocumentCrop(dataUrl: string): Promise<string | null> {
         approx.delete()
       }
     }
-
+      
     let warped = new cv.Mat()
     if (bestCnt && bestArea > 10000) {
       // --- Perspective warp ---
@@ -119,6 +157,14 @@ async function processDocumentCrop(dataUrl: string): Promise<string | null> {
         const p = bestCnt.intPtr(i, 0)
         pts.push({ x: p[0], y: p[1] })
       }
+     // Scale points back to original resolution
+      if (scale < 1) {
+        for (const p of pts) {
+          p.x = p.x / scale
+          p.y = p.y / scale
+        }
+      }
+
       // Sort roughly clockwise
       pts.sort((a, b) => a.y - b.y)
       const top = pts.slice(0, 2).sort((a, b) => a.x - b.x)
@@ -140,43 +186,56 @@ async function processDocumentCrop(dataUrl: string): Promise<string | null> {
       ])
       const dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, W, 0, W, H, 0, H])
       const M = cv.getPerspectiveTransform(srcPts, dstPts)
-      cv.warpPerspective(resized, warped, M, new cv.Size(W, H))
+      cv.warpPerspective(src, warped, M, new cv.Size(W, H))
       srcPts.delete(); dstPts.delete(); M.delete()
     } else {
-      warped = resized.clone() // fallback: no contour
+      warped = src.clone() // fallback: no contour
     }
 
-    // --- Color correction ---
-    // Convert to float for math
-    const floatImg = new cv.Mat()
-    warped.convertTo(floatImg, cv.CV_32F)
-    const mean = new cv.Mat()
-    const stddev = new cv.Mat()
-    cv.meanStdDev(floatImg, mean, stddev)
-    const meanVals = mean.data64F
-    const ref = (meanVals[0] + meanVals[1] + meanVals[2]) / 3
-    const scaleB = ref / meanVals[0]
-    const scaleG = ref / meanVals[1]
-    const scaleR = ref / meanVals[2]
+    // --- Edge cleanup / overcrop ---
+    const grayWarped = new cv.Mat()
+    cv.cvtColor(warped, grayWarped, cv.COLOR_RGBA2GRAY)
 
-    const channels = new cv.MatVector()
-    cv.split(warped, channels)
-    channels.get(0).convertTo(channels.get(0), -1, scaleB, 0)
-    channels.get(1).convertTo(channels.get(1), -1, scaleG, 0)
-    channels.get(2).convertTo(channels.get(2), -1, scaleR, 0)
-    cv.merge(channels, warped)
-    channels.delete(); mean.delete(); stddev.delete()
+    // threshold to detect non-black area (the real document content)
+    const maskWarped = new cv.Mat()
+    cv.threshold(grayWarped, maskWarped, 10, 255, cv.THRESH_BINARY)
 
-    // --- Mild contrast and sharpen ---
-    cv.convertScaleAbs(warped, warped, 1.1, -15)
-    const kernel = cv.matFromArray(3, 3, cv.CV_32F, [
-      0, -1, 0,
-      -1, 5, -1,
-      0, -1, 0,
-    ])
-    cv.filter2D(warped, warped, -1, kernel)
-    kernel.delete()
-    
+    // --- Find bounding box of non-black area (findNonZero replacement) ---
+    const contoursWarped = new cv.MatVector()
+    const hierarchyWarped = new cv.Mat()
+    cv.findContours(maskWarped, contoursWarped, hierarchyWarped, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+    if (contoursWarped.size() > 0) {
+      let biggestRect = null
+      let biggestArea = 0
+      for (let i = 0; i < contoursWarped.size(); i++) {
+        const rect = cv.boundingRect(contoursWarped.get(i))
+        const area = rect.width * rect.height
+        if (area > biggestArea) {
+          biggestArea = area
+          biggestRect = rect
+        }
+      }
+
+      if (biggestRect && biggestArea > 10000) {
+        // Apply a small inward crop margin (1–2%)
+        const marginX = Math.floor(biggestRect.width * 0.02)
+        const marginY = Math.floor(biggestRect.height * 0.02)
+        const x = Math.min(Math.max(biggestRect.x + marginX, 0), warped.cols - 1)
+        const y = Math.min(Math.max(biggestRect.y + marginY, 0), warped.rows - 1)
+        const w = Math.max(biggestRect.width - marginX * 2, 1)
+        const h = Math.max(biggestRect.height - marginY * 2, 1)
+
+        const cropped = warped.roi(new cv.Rect(x, y, w, h))
+        warped.delete()
+        warped = cropped.clone()
+        cropped.delete()
+      }
+    }
+
+    contoursWarped.delete(); hierarchyWarped.delete()
+    grayWarped.delete(); maskWarped.delete()
+
         // --- Auto-rotate upright ---
     const rotations = [0, 90, 180, 270]
     let bestScore = -Infinity
@@ -237,15 +296,99 @@ async function processDocumentCrop(dataUrl: string): Promise<string | null> {
     warped.delete()
     warped = bestRotated
 
+    // --- Shadow gradient correction ---
+    const illumGray = new cv.Mat()
+    cv.cvtColor(warped, illumGray, cv.COLOR_RGBA2GRAY)
+
+    // Estimate background lighting (large blur)
+    const background = new cv.Mat()
+    const ksize = new cv.Size(101, 101) // big enough to smooth shadows, but not text
+    cv.GaussianBlur(illumGray, background, ksize, 0)
+
+    // Convert to float to do per-pixel division
+    const floatWarped = new cv.Mat()
+    const floatBg = new cv.Mat()
+    illumGray.convertTo(floatWarped, cv.CV_32F)
+    background.convertTo(floatBg, cv.CV_32F)
+
+    // Prevent divide-by-zero by adding a small constant to the illumination map
+    cv.add(floatBg, new cv.Mat(floatBg.rows, floatBg.cols, floatBg.type(), new cv.Scalar(1, 1, 1, 1)), floatBg)
+
+
+    // Divide original by illumination map (normalize lighting)
+    cv.divide(floatWarped, floatBg, floatWarped)
+
+
+    // Normalize to 0–255 range
+    cv.normalize(floatWarped, floatWarped, 0, 255, cv.NORM_MINMAX)
+
+    // Convert back to 8-bit
+    const correctedGray = new cv.Mat()
+    floatWarped.convertTo(correctedGray, cv.CV_8U)
+
+    // Use the illumination-corrected grayscale as a guide to fix color channels
+    const correctedColor = new cv.Mat()
+    const channels = new cv.MatVector()
+    cv.split(warped, channels)
+    for (let i = 0; i < 3; i++) {
+      const chan = new cv.Mat()
+      channels.get(i).convertTo(chan, cv.CV_32F)
+      cv.divide(chan, floatBg, chan)
+      cv.normalize(chan, chan, 0, 255, cv.NORM_MINMAX)
+      chan.convertTo(chan, cv.CV_8U)
+      channels.set(i, chan)
+      chan.delete()
+    }
+    cv.merge(channels, correctedColor)
+    warped.delete()
+    warped = correctedColor.clone()
+
+
+    // --- Apply Photoshop-style lighten curve ---
+    const lightenCurve = (src: cv.Mat): cv.Mat => {
+      const dst = new cv.Mat()
+      const floatSrc = new cv.Mat()
+      src.convertTo(floatSrc, cv.CV_32F, 1.0 / 255.0)
+
+      // Apply a soft lighten curve:
+      //  - keep shadows mostly unchanged (<0.3)
+      //  - brighten highlights progressively
+      const lut = new cv.Mat(1, 256, cv.CV_8UC1)
+      for (let i = 0; i < 256; i++) {
+        const x = i / 255.0
+        // Smooth "S-curve" style lighten adjustment
+        const y = x < 0.3 ? x : 1.0 - Math.pow(1.0 - x, 1.5)
+        lut.ucharPtr(0, i)[0] = Math.min(255, Math.max(0, Math.round(y * 255)))
+      }
+
+      cv.LUT(src, lut, dst)
+
+      floatSrc.delete()
+      lut.delete()
+      return dst
+    }
+
+    // Apply the curve to the result
+    warped = lightenCurve(warped)
+
+    // Cleanup
+    illumGray.delete(); background.delete()
+    floatWarped.delete(); floatBg.delete()
+    correctedGray.delete(); correctedColor.delete()
+    channels.delete()
+    
+
     // --- Export ---
     const canvas = document.createElement("canvas")
     cv.imshow(canvas, warped)
 
     // cleanup
-    src.delete(); resized.delete(); gray.delete(); edges.delete()
+    src.delete(); resized.delete(); gray.delete(); mask.delete(); kernel_2.delete();
     contours.delete(); hierarchy.delete()
     if (bestCnt) bestCnt.delete()
-    warped.delete(); floatImg.delete()
+    warped.delete();
+  
+
 
     return canvas.toDataURL("image/jpeg", 0.9)
   } catch (e) {
@@ -260,25 +403,21 @@ export default function ScannerPage() {
   const cvReady = useOpenCV()
   const { connected, statusText, state, sendCmd } = useHardwareWS()
   const [processedImg, setProcessedImg] = useState<string | null>(null)
+  const [previewVisible, setPreviewVisible] = useState(false)
   const lastDownloadedRef = useRef<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
 
-  // Wait until OpenCV is ready before scanning
   useEffect(() => {
     if (!cvReady) return
     console.log("✅ OpenCV.js loaded and ready!")
   }, [cvReady])
 
-  // Auto open scanner on mount (when connected) and close on unmount
   useEffect(() => {
-    if (connected) {
-      sendCmd("highCamera", "open")
-    }
-    return () => {
-      sendCmd("highCamera", "close")
-    }
+    if (connected) sendCmd("highCamera", "open")
+    return () => sendCmd("highCamera", "close")
   }, [connected, sendCmd])
 
-  // Auto-download new captures
+  // When new photo is captured from the scanner
   useEffect(() => {
     if (!state.photoImg) return
     if (lastDownloadedRef.current === state.photoImg) return
@@ -286,15 +425,10 @@ export default function ScannerPage() {
 
     let active = true
     ;(async () => {
-      const ts = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19)
-      const filename = `scanner-photo-cropped-${ts}.jpg`
-
       const processed = await processDocumentCrop(state.photoImg!)
-      const out = processed || state.photoImg!
       if (!active) return
-
-      setProcessedImg(out)
-      downloadDataUrl(out, filename)
+      setProcessedImg(processed || state.photoImg!)
+      setPreviewVisible(true)
     })()
 
     return () => {
@@ -302,19 +436,58 @@ export default function ScannerPage() {
     }
   }, [state.photoImg])
 
+const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const file = e.target.files?.[0]
+  if (!file) return
+
+  const reader = new FileReader()
+
+  reader.onload = (ev) => {
+    const result = ev.target?.result as string
+    if (!result) return
+
+    // Wrap in async IIFE so React event loop handles it properly
+    ;(async () => {
+      console.log("📤 Upload started, running processDocumentCrop...")
+      try {
+        const processed = await processDocumentCrop(result)
+        console.log("✅ Processing done")
+        setProcessedImg(processed || result)
+        setPreviewVisible(true)
+      } catch (err) {
+        console.error("❌ Error processing uploaded image:", err)
+        setProcessedImg(result) // fallback
+        setPreviewVisible(true)
+      }
+    })()
+  }
+
+  reader.readAsDataURL(file)
+}
+
+
+  // Download manually
+  const handleDownload = () => {
+    if (!processedImg) return
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19)
+    downloadDataUrl(processedImg, `scanner-photo-cropped-${ts}.jpg`)
+  }
+
   return (
     <main className="min-h-dvh">
       <Header status={statusText as "Connected" | "Disconnected"} />
       <section className="mx-auto max-w-6xl px-4 py-6">
+        {/* Back Button */}
         <div className="mb-4">
           <Button asChild variant="secondary">
             <Link href="/">← Back to Home</Link>
           </Button>
         </div>
 
+        {/* Scanner Controls */}
         <Card>
           <CardHeader className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-            <CardTitle className="text-xl">High‑Speed Camera (Scanner)</CardTitle>
+            <CardTitle className="text-xl">High-Speed Camera (Scanner)</CardTitle>
             <div className="flex flex-wrap gap-2">
               <Button onClick={() => sendCmd("highCamera", "open")} disabled={!connected}>
                 Open
@@ -330,6 +503,7 @@ export default function ScannerPage() {
 
           <CardContent>
             <div className="grid grid-cols-1 gap-4 md:grid-cols-[1fr_220px]">
+              {/* Live Preview */}
               <div className="rounded-md border border-border bg-black">
                 <img
                   src={state.highPreview || "/placeholder.svg?height=420&width=720&query=high-speed-preview"}
@@ -338,28 +512,61 @@ export default function ScannerPage() {
                 />
               </div>
 
+              {/* Side Column */}
               <div className="flex flex-col gap-2">
-                <div className="text-sm font-medium text-muted-foreground">Last captured (cropped)</div>
+                <div className="text-sm font-medium text-muted-foreground">Upload or Last Captured</div>
+
+                {/* Upload */}
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={handleFileUpload}
+                  className="hidden"
+                />
+                <Button variant="outline" onClick={() => fileInputRef.current?.click()}>
+                  Upload Image
+                </Button>
+
+                {/* Thumbnail */}
                 <div className="rounded-md border border-border bg-black p-2">
                   <img
                     src={
                       processedImg ||
                       state.photoImg ||
-                      "/placeholder.svg?height=200&width=200&query=last-captured-photo" ||
-                      "/placeholder.svg" ||
-                      "/placeholder.svg"
+                      "/placeholder.svg?height=200&width=200&query=last-captured-photo"
                     }
                     alt="Last captured cropped document"
                     className="h-[200px] w-[200px] rounded object-contain"
                   />
                 </div>
+
                 <p className="text-xs text-muted-foreground">
-                  New photos are automatically cropped to the document and downloaded.
+                  New photos or uploads are processed and shown below for preview.
                 </p>
               </div>
             </div>
           </CardContent>
         </Card>
+
+        {/* Final Preview Section */}
+        {previewVisible && processedImg && (
+          <Card className="mt-6">
+            <CardHeader>
+              <CardTitle className="text-lg">Final Processed Result</CardTitle>
+            </CardHeader>
+            <CardContent className="flex flex-col items-center gap-4">
+              <img
+                src={processedImg}
+                alt="Final processed document"
+                className="w-full max-w-[100%] h-auto rounded-md border border-border object-contain"
+              />
+              <Button onClick={handleDownload} variant="default">
+                Download Cropped Result
+              </Button>
+            </CardContent>
+          </Card>
+        )}
       </section>
     </main>
   )
