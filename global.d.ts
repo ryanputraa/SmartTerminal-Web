@@ -8,4 +8,14 @@ declare global {
 
 }
 
+declare namespace cv {
+  class Mat {
+    rows: number
+    cols: number
+    data: any
+    delete(): void
+  }
+}
+
+
 export {}
