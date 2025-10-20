@@ -15,7 +15,7 @@ export default function Page() {
         <div className="mb-10 max-w-3xl">
           <h2 className="text-pretty text-3xl font-semibold leading-tight">AIRES SmartTerminal</h2>
           <p className="mt-2 text-muted-foreground">
-            Choose a device to begin. Use the Camera for face detection, or the High‑Speed Camera (Scanner) to capture
+            Choose a device to begin. Use the Camera for face detection, or the Scanner to capture
             and auto‑download photos.
           </p>
         </div>
@@ -37,7 +37,7 @@ export default function Page() {
 
           <Card className="transition hover:shadow-lg">
             <CardHeader>
-              <CardTitle className="text-balance text-2xl">High‑Speed Camera (Scanner)</CardTitle>
+              <CardTitle className="text-balance text-2xl">Scanner</CardTitle>
             </CardHeader>
             <CardContent className="flex flex-col items-start gap-4">
               <p className="text-muted-foreground">
