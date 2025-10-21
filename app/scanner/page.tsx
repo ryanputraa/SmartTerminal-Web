@@ -76,7 +76,9 @@ function useOpenCV() {
 async function processDocumentCrop(
   dataUrl: string,
   enableShadowCorrection: boolean,
-  enableColorCorrection: boolean
+  enableColorCorrection: boolean,
+  enableBlackAndWhite: boolean,
+  enableAutoCrop: boolean
 ): Promise<string | null> {
   // --- Wait for OpenCV to be ready ---
   if (typeof cv === "undefined") {
@@ -96,163 +98,163 @@ async function processDocumentCrop(
     const mask = new cv.Mat()
     const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5))
 
-    // --- Downscale for contour detection ---
-    const maxDim = 1400
-    const scale = Math.min(1, maxDim / Math.max(src.cols, src.rows))
-    if (scale < 1) cv.resize(src, resized, new cv.Size(0, 0), scale, scale, cv.INTER_AREA)
-    else src.copyTo(resized)
-
-    cv.cvtColor(resized, gray, cv.COLOR_RGBA2GRAY)
-    cv.threshold(gray, mask, 5, 255, cv.THRESH_BINARY)
-    cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel)
-    cv.morphologyEx(mask, mask, cv.MORPH_OPEN, kernel)
-
-    const contours = new cv.MatVector()
-    const hierarchy = new cv.Mat()
-    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-
+    let warped = new cv.Mat()
     let bestCnt: Mat | null = null
-    let bestArea = 0
 
-    for (let i = 0; i < contours.size(); i++) {
-      const cnt = contours.get(i)
-      const peri = cv.arcLength(cnt, true)
-      const approx = new cv.Mat()
-      cv.approxPolyDP(cnt, approx, 0.02 * peri, true)
-      if (approx.rows === 4) {
-        const area = cv.contourArea(approx)
-        if (area > bestArea) {
-          bestArea = area
-          if (bestCnt) bestCnt.delete()
-          bestCnt = approx.clone()
+    if (enableAutoCrop) {
+      console.log("✅ AutoCrop ENABLED")
+
+      // --- Downscale for contour detection ---
+      const maxDim = 1400
+      const scale = Math.min(1, maxDim / Math.max(src.cols, src.rows))
+      if (scale < 1) cv.resize(src, resized, new cv.Size(0, 0), scale, scale, cv.INTER_AREA)
+      else src.copyTo(resized)
+
+      cv.cvtColor(resized, gray, cv.COLOR_RGBA2GRAY)
+      cv.threshold(gray, mask, 5, 255, cv.THRESH_BINARY)
+      cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel)
+      cv.morphologyEx(mask, mask, cv.MORPH_OPEN, kernel)
+
+      const contours = new cv.MatVector()
+      const hierarchy = new cv.Mat()
+      cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+      let bestArea = 0
+      for (let i = 0; i < contours.size(); i++) {
+        const cnt = contours.get(i)
+        const peri = cv.arcLength(cnt, true)
+        const approx = new cv.Mat()
+        cv.approxPolyDP(cnt, approx, 0.02 * peri, true)
+        if (approx.rows === 4) {
+          const area = cv.contourArea(approx)
+          if (area > bestArea) {
+            bestArea = area
+            if (bestCnt) bestCnt.delete()
+            bestCnt = approx.clone()
+          }
+        }
+        cnt.delete()
+        approx.delete()
+      }
+
+      // --- Perspective Warp ---
+      if (bestCnt && bestArea > 10000) {
+        const pts: { x: number; y: number }[] = []
+        for (let i = 0; i < 4; i++) {
+          const p = bestCnt.intPtr(i, 0)
+          pts.push({ x: p[0], y: p[1] })
+        }
+        if (scale < 1) for (const p of pts) { p.x /= scale; p.y /= scale }
+
+        pts.sort((a, b) => a.y - b.y)
+        const top = pts.slice(0, 2).sort((a, b) => a.x - b.x)
+        const bottom = pts.slice(2).sort((a, b) => a.x - b.x)
+        const ordered = [top[0], top[1], bottom[1], bottom[0]]
+
+        const w1 = Math.hypot(ordered[1].x - ordered[0].x, ordered[1].y - ordered[0].y)
+        const w2 = Math.hypot(ordered[2].x - ordered[3].x, ordered[2].y - ordered[3].y)
+        const h1 = Math.hypot(ordered[3].x - ordered[0].x, ordered[3].y - ordered[0].y)
+        const h2 = Math.hypot(ordered[2].x - ordered[1].x, ordered[2].y - ordered[1].y)
+        const W = Math.max(w1, w2)
+        const H = Math.max(h1, h2)
+
+        const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
+          ordered[0].x, ordered[0].y,
+          ordered[1].x, ordered[1].y,
+          ordered[2].x, ordered[2].y,
+          ordered[3].x, ordered[3].y,
+        ])
+        const dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, W, 0, W, H, 0, H])
+        const M = cv.getPerspectiveTransform(srcPts, dstPts)
+        cv.warpPerspective(src, warped, M, new cv.Size(W, H))
+
+        srcPts.delete(); dstPts.delete(); M.delete()
+      } else {
+        src.copyTo(warped)
+      }
+
+      // --- Edge Cleanup ---
+      const grayWarped = new cv.Mat()
+      const maskWarped = new cv.Mat()
+      cv.cvtColor(warped, grayWarped, cv.COLOR_RGBA2GRAY)
+      cv.threshold(grayWarped, maskWarped, 10, 255, cv.THRESH_BINARY)
+      const contoursWarped = new cv.MatVector()
+      const hierarchyWarped = new cv.Mat()
+      cv.findContours(maskWarped, contoursWarped, hierarchyWarped, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+      if (contoursWarped.size() > 0) {
+        let biggestRect: any = null
+        let biggestArea = 0
+        for (let i = 0; i < contoursWarped.size(); i++) {
+          const rect = cv.boundingRect(contoursWarped.get(i))
+          const area = rect.width * rect.height
+          if (area > biggestArea) { biggestArea = area; biggestRect = rect }
+        }
+        if (biggestRect && biggestArea > 10000) {
+          const marginX = Math.floor(biggestRect.width * 0.02)
+          const marginY = Math.floor(biggestRect.height * 0.02)
+          const x = Math.min(Math.max(biggestRect.x + marginX, 0), warped.cols - 1)
+          const y = Math.min(Math.max(biggestRect.y + marginY, 0), warped.rows - 1)
+          const w = Math.max(biggestRect.width - marginX * 2, 1)
+          const h = Math.max(biggestRect.height - marginY * 2, 1)
+          const cropped = warped.roi(new cv.Rect(x, y, w, h))
+          warped.delete()
+          warped = cropped.clone()
+          cropped.delete()
         }
       }
-      cnt.delete()
-      approx.delete()
-    }
 
-    let warped = new cv.Mat()
+      contoursWarped.delete()
+      hierarchyWarped.delete()
+      grayWarped.delete()
+      maskWarped.delete()
 
-    if (bestCnt && bestArea > 10000) {
-      const pts: { x: number; y: number }[] = []
-      for (let i = 0; i < 4; i++) {
-        const p = bestCnt.intPtr(i, 0)
-        pts.push({ x: p[0], y: p[1] })
+      // --- Auto-Rotate ---
+      const rotations = [0, 90, 180, 270]
+      let bestScore = -Infinity
+      let bestRotated: Mat | null = null
+
+      for (const angle of rotations) {
+        const rotated = new cv.Mat()
+        if (angle === 90) cv.rotate(warped, rotated, cv.ROTATE_90_CLOCKWISE)
+        else if (angle === 180) cv.rotate(warped, rotated, cv.ROTATE_180)
+        else if (angle === 270) cv.rotate(warped, rotated, cv.ROTATE_90_COUNTERCLOCKWISE)
+        else warped.copyTo(rotated)
+
+        const grayR = new cv.Mat()
+        cv.cvtColor(rotated, grayR, cv.COLOR_RGBA2GRAY)
+        cv.GaussianBlur(grayR, grayR, new cv.Size(3, 3), 0)
+
+        const sobelX = new cv.Mat(), sobelY = new cv.Mat()
+        cv.Sobel(grayR, sobelX, cv.CV_32F, 1, 0, 3)
+        cv.Sobel(grayR, sobelY, cv.CV_32F, 0, 1, 3)
+
+        const absX = new cv.Mat(), absY = new cv.Mat()
+        cv.convertScaleAbs(sobelX, absX)
+        cv.convertScaleAbs(sobelY, absY)
+
+        const meanX = cv.mean(absX)[0]
+        const meanY = cv.mean(absY)[0]
+        const score = meanX - meanY
+        const isPortrait = rotated.rows >= rotated.cols
+        const EPS = 2.0
+
+        if (score > bestScore + 1e-6 || (Math.abs(score - bestScore) <= EPS && isPortrait)) {
+          if (bestRotated) bestRotated.delete()
+          bestRotated = rotated.clone()
+          bestScore = score
+        }
+
+        rotated.delete(); grayR.delete(); sobelX.delete(); sobelY.delete(); absX.delete(); absY.delete()
       }
-      if (scale < 1) for (const p of pts) { p.x /= scale; p.y /= scale }
 
-      pts.sort((a, b) => a.y - b.y)
-      const top = pts.slice(0, 2).sort((a, b) => a.x - b.x)
-      const bottom = pts.slice(2).sort((a, b) => a.x - b.x)
-      const ordered = [top[0], top[1], bottom[1], bottom[0]]
-
-      const w1 = Math.hypot(ordered[1].x - ordered[0].x, ordered[1].y - ordered[0].y)
-      const w2 = Math.hypot(ordered[2].x - ordered[3].x, ordered[2].y - ordered[3].y)
-      const h1 = Math.hypot(ordered[3].x - ordered[0].x, ordered[3].y - ordered[0].y)
-      const h2 = Math.hypot(ordered[2].x - ordered[1].x, ordered[2].y - ordered[1].y)
-      const W = Math.max(w1, w2)
-      const H = Math.max(h1, h2)
-
-      const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
-        ordered[0].x, ordered[0].y,
-        ordered[1].x, ordered[1].y,
-        ordered[2].x, ordered[2].y,
-        ordered[3].x, ordered[3].y,
-      ])
-      const dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, W, 0, W, H, 0, H])
-      const M = cv.getPerspectiveTransform(srcPts, dstPts)
-      cv.warpPerspective(src, warped, M, new cv.Size(W, H))
-
-      srcPts.delete(); dstPts.delete(); M.delete()
+      if (!bestRotated) bestRotated = warped.clone()
+      warped.delete()
+      warped = bestRotated
     } else {
+      console.log("❌ AutoCrop DISABLED — using raw image")
       src.copyTo(warped)
     }
-
-    // --- Edge Cleanup ---
-    const grayWarped = new cv.Mat()
-    const maskWarped = new cv.Mat()
-    cv.cvtColor(warped, grayWarped, cv.COLOR_RGBA2GRAY)
-    cv.threshold(grayWarped, maskWarped, 10, 255, cv.THRESH_BINARY)
-    const contoursWarped = new cv.MatVector()
-    const hierarchyWarped = new cv.Mat()
-    cv.findContours(maskWarped, contoursWarped, hierarchyWarped, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-
-    if (contoursWarped.size() > 0) {
-      let biggestRect: any = null
-      let biggestArea = 0
-      for (let i = 0; i < contoursWarped.size(); i++) {
-        const rect = cv.boundingRect(contoursWarped.get(i))
-        const area = rect.width * rect.height
-        if (area > biggestArea) { biggestArea = area; biggestRect = rect }
-      }
-      if (biggestRect && biggestArea > 10000) {
-        const marginX = Math.floor(biggestRect.width * 0.02)
-        const marginY = Math.floor(biggestRect.height * 0.02)
-        const x = Math.min(Math.max(biggestRect.x + marginX, 0), warped.cols - 1)
-        const y = Math.min(Math.max(biggestRect.y + marginY, 0), warped.rows - 1)
-        const w = Math.max(biggestRect.width - marginX * 2, 1)
-        const h = Math.max(biggestRect.height - marginY * 2, 1)
-        const cropped = warped.roi(new cv.Rect(x, y, w, h))
-        warped.delete()
-        warped = cropped.clone()
-        cropped.delete()
-      }
-    }
-
-    contoursWarped.delete()
-    hierarchyWarped.delete()
-    grayWarped.delete()
-    maskWarped.delete()
-
-    // --- Auto-rotate (robust and stable) ---
-    const rotations = [0, 90, 180, 270];
-    let bestScore = -Infinity;
-    let bestRotated: Mat | null = null;
-
-    for (const angle of rotations) {
-      const rotated = new cv.Mat();
-      if (angle === 90) cv.rotate(warped, rotated, cv.ROTATE_90_CLOCKWISE);
-      else if (angle === 180) cv.rotate(warped, rotated, cv.ROTATE_180);
-      else if (angle === 270) cv.rotate(warped, rotated, cv.ROTATE_90_COUNTERCLOCKWISE);
-      else warped.copyTo(rotated);
-
-      const grayR = new cv.Mat();
-      cv.cvtColor(rotated, grayR, cv.COLOR_RGBA2GRAY);
-      cv.GaussianBlur(grayR, grayR, new cv.Size(3, 3), 0); // ✅ restore blur
-
-      const sobelX = new cv.Mat(), sobelY = new cv.Mat();
-      cv.Sobel(grayR, sobelX, cv.CV_32F, 1, 0, 3);
-      cv.Sobel(grayR, sobelY, cv.CV_32F, 0, 1, 3);
-
-      const absX = new cv.Mat(), absY = new cv.Mat();
-      cv.convertScaleAbs(sobelX, absX);
-      cv.convertScaleAbs(sobelY, absY);
-
-      const meanX = cv.mean(absX)[0];
-      const meanY = cv.mean(absY)[0];
-      const score = meanX - meanY;
-
-      const isPortrait = rotated.rows >= rotated.cols;
-      const EPS = 2.0;
-
-      // ✅ tie-breaker to avoid flipping 180°
-      if (score > bestScore + 1e-6 || (Math.abs(score - bestScore) <= EPS && isPortrait)) {
-        if (bestRotated) bestRotated.delete();
-        bestRotated = rotated.clone();
-        bestScore = score;
-      }
-
-      rotated.delete();
-      grayR.delete();
-      sobelX.delete();
-      sobelY.delete();
-      absX.delete();
-      absY.delete();
-    }
-
-    if (!bestRotated) bestRotated = warped.clone();
-    warped.delete();
-    warped = bestRotated;
 
     // --- Shadow Correction + Lighten ---
 
@@ -388,14 +390,20 @@ async function processDocumentCrop(
       console.log("❌ Skipping color correction")
     }
 
+    if (enableBlackAndWhite) {
+    const gray = new cv.Mat()
+    cv.cvtColor(warped, gray, cv.COLOR_RGBA2GRAY)
+    cv.cvtColor(gray, warped, cv.COLOR_GRAY2RGBA)
+    gray.delete()
+  }
+
 
     // --- Export result ---
     const canvas = document.createElement("canvas")
     cv.imshow(canvas, warped)
 
     // --- Cleanup ---
-    src.delete(); resized.delete(); gray.delete(); mask.delete(); kernel.delete(); contours.delete(); hierarchy.delete()
-    if (bestCnt) bestCnt.delete()
+    src.delete(); resized.delete(); gray.delete(); mask.delete(); kernel.delete();
     warped.delete()
 
     return canvas.toDataURL("image/jpeg", 0.95)
@@ -418,6 +426,9 @@ export default function ScannerPage() {
   const lastRef = useRef<string | null>(null)
   const [enableColorCorrection, setEnableColorCorrection] = useState(true)
   const [enableShadowCorrection, setEnableShadowCorrection] = useState(true)
+  const [enableBlackAndWhite, setEnableBlackAndWhite] = useState(false)
+  const [enableAutoCrop, setEnableAutoCrop] = useState(true)
+
 
 
 
@@ -439,10 +450,10 @@ export default function ScannerPage() {
   if (!photo || lastRef.current === photo || !isScanning) return
   lastRef.current = photo
   ;(window.requestIdleCallback || window.setTimeout)(async () => {
-    const out = await processDocumentCrop(photo, enableShadowCorrection, enableColorCorrection)
+    const out = await processDocumentCrop(photo, enableShadowCorrection, enableColorCorrection, enableBlackAndWhite, enableAutoCrop)
     setScannedPages(prev => [...prev, out || photo])
   })
-}, [state.photoImg, isScanning, enableShadowCorrection, enableColorCorrection])
+}, [state.photoImg, isScanning, enableShadowCorrection, enableColorCorrection, enableBlackAndWhite])
 
   
 
@@ -456,13 +467,13 @@ export default function ScannerPage() {
     reader.onload = async ev => {
       const result = ev.target?.result as string
       if (!result) return
-      const out = await processDocumentCrop(result, enableShadowCorrection, enableColorCorrection)
+      const out = await processDocumentCrop(result, enableShadowCorrection, enableColorCorrection, enableBlackAndWhite, enableAutoCrop)
       setScannedPages(prev => [...prev, out || result])
       setIsScanning(true)
     }
     e.currentTarget.value = ""
     reader.readAsDataURL(file)
-  }, [enableShadowCorrection, enableColorCorrection])
+  }, [enableShadowCorrection, enableColorCorrection, enableBlackAndWhite])
 
   const handleStartScan = useCallback(() => {
     setIsScanning(true)
@@ -567,12 +578,20 @@ export default function ScannerPage() {
                 </Button>
                 <div className="flex flex-col gap-2 mt-2">
                 <label className="flex items-center gap-2">
+                  <Checkbox checked={enableAutoCrop} onCheckedChange={v => setEnableAutoCrop(v === true)} />
+                  <span>Auto Crop</span>
+                </label>
+                <label className="flex items-center gap-2">
                   <Checkbox checked={enableColorCorrection} onCheckedChange={v => setEnableColorCorrection(v === true)} />
                   <span>Color Correction</span>
                 </label>
                 <label className="flex items-center gap-2">
                   <Checkbox checked={enableShadowCorrection} onCheckedChange={v => setEnableShadowCorrection(v === true)} />
                   <span>Shadow Correction</span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <Checkbox checked={enableBlackAndWhite} onCheckedChange={v => setEnableBlackAndWhite(v === true)} />
+                  <span>Grayscale</span>
                 </label>
               </div>
               </div>
